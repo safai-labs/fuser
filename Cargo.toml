@@ -33,7 +33,7 @@ serde = {version = "1.0.102", features=["std", "derive"]}
 pkg-config = {version = "0.3.14", optional = true }
 
 [features]
-default = ["libfuse"]
+default = ["libfuse", "abi-7-31"]
 libfuse = ["pkg-config"]
 serializable = ["serde"]
 abi-7-9 = []

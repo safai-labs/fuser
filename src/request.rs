@@ -748,4 +748,11 @@ impl<'a> Request<'a> {
     pub fn pid(&self) -> u32 {
         self.request.pid()
     }
+
+    /// Returns the nodeid of this request
+    #[inline]
+    #[allow(dead_code)]
+    pub fn nodeid(&self) -> u64 {
+        self.request.nodeid()
+    }
 }
