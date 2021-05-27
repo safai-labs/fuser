@@ -6,19 +6,17 @@
 //! for filesystem operations under its mount point.
 
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
-use log::{error, info};
-#[cfg(feature = "libfuse")]
-use std::ffi::OsStr;
-use std::io;
+use log::info;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
-use std::{fmt, ptr};
+use std::{io, ops::DerefMut};
 
-use crate::channel::{self, Channel};
+use crate::ll::fuse_abi as abi;
 use crate::request::Request;
 use crate::Filesystem;
-#[cfg(not(feature = "libfuse"))]
 use crate::MountOption;
+use crate::{channel::Channel, mnt::Mount};
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
@@ -36,6 +34,10 @@ pub struct Session<FS: Filesystem> {
     pub filesystem: FS,
     /// Communication channel to the kernel driver
     ch: Channel,
+    /// Handle to the mount.  Dropping this unmounts.
+    mount: Option<Mount>,
+    /// Mount point
+    mountpoint: PathBuf,
     /// FUSE protocol major version
     pub proto_major: u32,
     /// FUSE protocol minor version
@@ -48,30 +50,19 @@ pub struct Session<FS: Filesystem> {
 
 impl<FS: Filesystem> Session<FS> {
     /// Create a new session by mounting the given filesystem to the given mountpoint
-    #[cfg(feature = "libfuse")]
-    pub fn new(filesystem: FS, mountpoint: &Path, options: &[&OsStr]) -> io::Result<Session<FS>> {
-        info!("Mounting {}", mountpoint.display());
-        Channel::new(mountpoint, options).map(|ch| Session {
-            filesystem,
-            ch,
-            proto_major: 0,
-            proto_minor: 0,
-            initialized: false,
-            destroyed: false,
-        })
-    }
-
-    /// Create a new session by mounting the given filesystem to the given mountpoint
-    #[cfg(not(feature = "libfuse"))]
-    pub fn new2(
+    pub fn new(
         filesystem: FS,
         mountpoint: &Path,
         options: &[MountOption],
     ) -> io::Result<Session<FS>> {
         info!("Mounting {}", mountpoint.display());
-        Channel::new2(mountpoint, options).map(|ch| Session {
+        let (file, mount) = Mount::new(mountpoint, options)?;
+        let ch = Channel::new(file);
+        Ok(Session {
             filesystem,
             ch,
+            mount: Some(mount),
+            mountpoint: mountpoint.to_owned(),
             proto_major: 0,
             proto_minor: 0,
             initialized: false,
@@ -81,7 +72,7 @@ impl<FS: Filesystem> Session<FS> {
 
     /// Return path of the mounted filesystem
     pub fn mountpoint(&self) -> &Path {
-        &self.ch.mountpoint()
+        &self.mountpoint
     }
 
     /// Run the session loop that receives kernel requests and dispatches them to method
@@ -91,12 +82,16 @@ impl<FS: Filesystem> Session<FS> {
     pub fn run(&mut self) -> io::Result<()> {
         // Buffer for receiving requests from the kernel. Only one is allocated and
         // it is reused immediately after dispatching to conserve memory and allocations.
-        let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
+        let mut buffer = vec![0; BUFFER_SIZE];
+        let buf = aligned_sub_buf(
+            buffer.deref_mut(),
+            std::mem::align_of::<abi::fuse_in_header>(),
+        );
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive(&mut buffer) {
-                Ok(()) => match Request::new(self.ch.sender(), &buffer) {
+            match self.ch.receive(buf) {
+                Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
                     Some(req) => req.dispatch(self),
                     // Quit loop on illegal request
@@ -117,6 +112,19 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
         Ok(())
+    }
+    /// Unmount the filesystem
+    pub fn unmount(&mut self) {
+        drop(std::mem::take(&mut self.mount));
+    }
+}
+
+fn aligned_sub_buf(buf: &mut [u8], alignment: usize) -> &mut [u8] {
+    let off = alignment - (buf.as_ptr() as usize) % alignment;
+    if off == alignment {
+        buf
+    } else {
+        &mut buf[off..]
     }
 }
 
@@ -139,8 +147,8 @@ pub struct BackgroundSession {
     pub mountpoint: PathBuf,
     /// Thread guard of the background session
     pub guard: JoinHandle<io::Result<()>>,
-    fuse_session: *mut libc::c_void,
-    fd: libc::c_int,
+    /// Ensures the filesystem is unmounted when the session ends
+    _mount: Mount,
 }
 
 impl BackgroundSession {
@@ -152,9 +160,8 @@ impl BackgroundSession {
     ) -> io::Result<BackgroundSession> {
         let mountpoint = se.mountpoint().to_path_buf();
         // Take the fuse_session, so that we can unmount it
-        let fuse_session = se.ch.fuse_session;
-        let fd = se.ch.fd;
-        se.ch.fuse_session = ptr::null_mut();
+        let mount = std::mem::take(&mut se.mount);
+        let mount = mount.ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
         let guard = thread::spawn(move || {
             let mut se = se;
             se.run()
@@ -162,21 +169,18 @@ impl BackgroundSession {
         Ok(BackgroundSession {
             mountpoint,
             guard,
-            fuse_session,
-            fd,
+            _mount: mount,
         })
     }
-}
-
-impl Drop for BackgroundSession {
-    fn drop(&mut self) {
-        info!("Unmounting {}", self.mountpoint.display());
-        // Unmounting the filesystem will eventually end the session loop,
-        // drop the session and hence end the background thread.
-        match channel::unmount(&self.mountpoint, self.fuse_session, self.fd) {
-            Ok(()) => (),
-            Err(err) => error!("Failed to unmount {}: {}", self.mountpoint.display(), err),
-        }
+    /// Unmount the filesystem and join the background thread.
+    pub fn join(self) {
+        let Self {
+            mountpoint: _,
+            guard,
+            _mount,
+        } = self;
+        drop(_mount);
+        guard.join().unwrap().unwrap();
     }
 }
 

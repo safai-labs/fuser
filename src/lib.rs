@@ -7,24 +7,23 @@
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
 use libc::{c_int, ENOSYS};
+use mnt::mount_options::parse_options_from_args;
 #[cfg(feature = "serializable")]
 use serde::{Deserialize, Serialize};
-use std::convert::AsRef;
 use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 #[cfg(feature = "abi-7-23")]
 use std::time::Duration;
 use std::time::SystemTime;
+use std::{convert::AsRef, io::ErrorKind};
 
-pub use crate::fuse_abi::consts;
-use crate::fuse_abi::consts::*;
-pub use crate::fuse_abi::FUSE_ROOT_ID;
-use crate::mount_options::check_option_conflicts;
-#[cfg(feature = "libfuse")]
-use crate::mount_options::option_to_string;
+use crate::ll::fuse_abi::consts::*;
+pub use crate::ll::fuse_abi::FUSE_ROOT_ID;
+pub use crate::ll::{fuse_abi::consts, TimeOrNow};
+use crate::mnt::mount_options::check_option_conflicts;
 use crate::session::MAX_WRITE_SIZE;
-pub use mount_options::MountOption;
+pub use mnt::mount_options::MountOption;
 #[cfg(target_os = "macos")]
 pub use reply::ReplyXTimes;
 pub use reply::ReplyXattr;
@@ -41,10 +40,8 @@ use std::cmp::max;
 use std::cmp::min;
 
 mod channel;
-mod fuse_abi;
-mod fuse_sys;
 mod ll;
-mod mount_options;
+mod mnt;
 mod reply;
 mod request;
 mod session;
@@ -280,16 +277,6 @@ impl KernelConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-/// Possible input arguments for atime & mtime, which can either be set to a specified time,
-/// or to the current time
-pub enum TimeOrNow {
-    /// Specific time provided
-    SpecificTime(SystemTime),
-    /// Current time
-    Now,
-}
-
 /// Filesystem trait.
 ///
 /// This trait must be implemented to provide a userspace filesystem via FUSE.
@@ -326,7 +313,7 @@ pub trait Filesystem {
     /// Like forget, but take multiple forget requests at once for performance. The default
     /// implementation will fallback to forget.
     #[cfg(feature = "abi-7-16")]
-    fn batch_forget(&mut self, req: &Request<'_>, nodes: &[fuse_abi::fuse_forget_one]) {
+    fn batch_forget(&mut self, req: &Request<'_>, nodes: &[ll::fuse_abi::fuse_forget_one]) {
         for node in nodes {
             self.forget(req, node.nodeid, node.nlookup);
         }
@@ -857,44 +844,26 @@ pub trait Filesystem {
 ///
 /// Note that you need to lead each option with a separate `"-o"` string. See
 /// `examples/hello.rs`.
-#[cfg(feature = "libfuse")]
 pub fn mount<FS: Filesystem, P: AsRef<Path>>(
     filesystem: FS,
     mountpoint: P,
     options: &[&OsStr],
 ) -> io::Result<()> {
+    let options = parse_options_from_args(options)?;
+    mount2(filesystem, mountpoint, options.as_ref())
+}
+
+/// Mount the given filesystem to the given mountpoint. This function will
+/// not return until the filesystem is unmounted.
+///
+/// NOTE: This will eventually replace mount(), once the API is stable
+pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
+    filesystem: FS,
+    mountpoint: P,
+    options: &[MountOption],
+) -> io::Result<()> {
+    check_option_conflicts(options)?;
     Session::new(filesystem, mountpoint.as_ref(), options).and_then(|mut se| se.run())
-}
-
-/// Mount the given filesystem to the given mountpoint. This function will
-/// not return until the filesystem is unmounted.
-///
-/// NOTE: This will eventually replace mount(), once the API is stable
-#[cfg(not(feature = "libfuse"))]
-pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
-    filesystem: FS,
-    mountpoint: P,
-    options: &[MountOption],
-) -> io::Result<()> {
-    check_option_conflicts(options)?;
-    Session::new2(filesystem, mountpoint.as_ref(), options).and_then(|mut se| se.run())
-}
-
-/// Mount the given filesystem to the given mountpoint. This function will
-/// not return until the filesystem is unmounted.
-///
-/// NOTE: This will eventually replace mount(), once the API is stable
-#[cfg(feature = "libfuse")]
-pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
-    filesystem: FS,
-    mountpoint: P,
-    options: &[MountOption],
-) -> io::Result<()> {
-    check_option_conflicts(options)?;
-    let options: Vec<String> = options.iter().map(|x| option_to_string(x)).collect();
-    let option_str = options.join(",");
-    let args = vec![OsStr::new("-o"), OsStr::new(&option_str)];
-    Session::new(filesystem, mountpoint.as_ref(), &args).and_then(|mut se| se.run())
 }
 
 /// Mount the given filesystem to the given mountpoint. This function spawns
@@ -907,11 +876,15 @@ pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
 ///
 /// This interface is inherently unsafe if the BackgroundSession is allowed to leak without being
 /// dropped. See rust-lang/rust#24292 for more details.
-#[cfg(feature = "libfuse")]
 pub fn spawn_mount<'a, FS: Filesystem + Send + 'static + 'a, P: AsRef<Path>>(
     filesystem: FS,
     mountpoint: P,
     options: &[&OsStr],
 ) -> io::Result<BackgroundSession> {
-    Session::new(filesystem, mountpoint.as_ref(), options).and_then(|se| se.spawn())
+    let options: Option<Vec<_>> = options
+        .iter()
+        .map(|x| Some(MountOption::from_str(x.to_str()?)))
+        .collect();
+    let options = options.ok_or(ErrorKind::InvalidData)?;
+    Session::new(filesystem, mountpoint.as_ref(), options.as_ref()).and_then(|se| se.spawn())
 }

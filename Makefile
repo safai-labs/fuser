@@ -11,7 +11,6 @@ pre:
 	cargo clippy --all-targets
 	cargo clippy --all-targets --no-default-features
 	cargo clippy --all-targets --features=abi-7-30
-
 xfstests:
 	docker build -t fuser:xfstests -f xfstests.Dockerfile .
 	# Additional permissions are needed to be able to mount FUSE

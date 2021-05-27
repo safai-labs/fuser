@@ -6,130 +6,94 @@
 #![warn(missing_debug_implementations)]
 #![allow(missing_docs)]
 
-#[cfg(not(feature = "libfuse"))]
-use crate::mount_options::{option_group, option_to_flag, option_to_string, MountOptionGroup};
-#[cfg(not(feature = "libfuse"))]
-use crate::MountOption;
-#[cfg(feature = "libfuse3")]
-use libc::c_void;
-use libc::{c_char, c_int};
-#[cfg(not(feature = "libfuse"))]
+use super::is_mounted;
+use super::mount_options::{option_to_string, MountOption};
+use libc::c_int;
 use log::{debug, error};
-#[cfg(not(feature = "libfuse"))]
 use std::ffi::{CStr, CString, OsStr};
-#[cfg(not(feature = "libfuse"))]
 use std::fs::{File, OpenOptions};
-#[cfg(not(feature = "libfuse"))]
 use std::io;
-#[cfg(not(feature = "libfuse"))]
 use std::io::{Error, ErrorKind, Read};
-#[cfg(not(feature = "libfuse"))]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(not(feature = "libfuse"))]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(not(feature = "libfuse"))]
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
-#[cfg(not(feature = "libfuse"))]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
-#[cfg(not(feature = "libfuse"))]
+use std::path::Path;
 use std::process::{Command, Stdio};
-#[cfg(not(feature = "libfuse"))]
+use std::sync::Arc;
 use std::{mem, ptr};
 
-#[cfg(not(feature = "libfuse"))]
 const FUSERMOUNT_BIN: &str = "fusermount";
-#[cfg(not(feature = "libfuse"))]
 const FUSERMOUNT3_BIN: &str = "fusermount3";
-#[cfg(not(feature = "libfuse"))]
 const FUSERMOUNT_COMM_ENV: &str = "_FUSE_COMMFD";
 
-#[repr(C)]
 #[derive(Debug)]
-pub struct fuse_args {
-    pub argc: c_int,
-    pub argv: *const *const c_char,
-    pub allocated: c_int,
+pub struct Mount {
+    mountpoint: CString,
+    auto_unmount_socket: Option<UnixStream>,
+    fuse_device: Arc<File>,
 }
-
-extern "C" {
-    // *_compat25 functions were introduced in FUSE 2.6 when function signatures changed.
-    // Therefore, the minimum version requirement for *_compat25 functions is libfuse-2.6.0.
-
-    #[cfg(feature = "libfuse2")]
-    pub fn fuse_mount_compat25(mountpoint: *const c_char, args: *const fuse_args) -> c_int;
-    #[cfg(all(
-        feature = "libfuse2",
-        not(any(
-            target_os = "macos",
-            target_os = "freebsd",
-            target_os = "dragonfly",
-            target_os = "openbsd",
-            target_os = "bitrig",
-            target_os = "netbsd"
+impl Mount {
+    pub fn new(mountpoint: &Path, options: &[MountOption]) -> io::Result<(Arc<File>, Mount)> {
+        let mountpoint = mountpoint.canonicalize()?;
+        let (file, sock) = fuse_mount_pure(mountpoint.as_os_str(), options)?;
+        let file = Arc::new(file);
+        Ok((
+            file.clone(),
+            Mount {
+                mountpoint: CString::new(mountpoint.as_os_str().as_bytes())?,
+                auto_unmount_socket: sock,
+                fuse_device: file,
+            },
         ))
-    ))]
-    pub fn fuse_unmount_compat22(mountpoint: *const c_char);
-    #[cfg(feature = "libfuse3")]
-    // Really this returns *fuse_session, but we don't need to access its fields
-    pub fn fuse_session_new(
-        args: *const fuse_args,
-        op: *const c_void, // This argument is really a *const fuse_lowlevel_ops, but we don't use them
-        op_size: libc::size_t,
-        userdata: *mut c_void,
-    ) -> *mut c_void;
-    #[cfg(feature = "libfuse3")]
-    pub fn fuse_session_mount(
-        se: *mut c_void, // This argument is really a *fuse_session
-        mountpoint: *const c_char,
-    ) -> c_int;
-    #[cfg(feature = "libfuse3")]
-    // This function's argument is really a *fuse_session
-    pub fn fuse_session_fd(se: *mut c_void) -> c_int;
-    #[cfg(feature = "libfuse3")]
-    // This function's argument is really a *fuse_session
-    pub fn fuse_session_unmount(se: *mut c_void);
-    #[cfg(feature = "libfuse3")]
-    // This function's argument is really a *fuse_session
-    pub fn fuse_session_destroy(se: *mut c_void);
+    }
 }
 
-#[cfg(not(feature = "libfuse"))]
-pub fn fuse_mount_pure(mountpoint: &OsStr, options: &[MountOption]) -> Result<c_int, io::Error> {
+impl Drop for Mount {
+    fn drop(&mut self) {
+        use std::io::ErrorKind::PermissionDenied;
+        if !is_mounted(&self.fuse_device) {
+            // If the filesystem has already been unmounted, avoid unmounting it again.
+            // Unmounting it a second time could cause a race with a newly mounted filesystem
+            // living at the same mountpoint
+            return;
+        }
+        if let Some(sock) = mem::take(&mut self.auto_unmount_socket) {
+            drop(sock);
+            // fusermount in auto-unmount mode, no more work to do.
+            return;
+        }
+        if let Err(err) = super::libc_umount(&self.mountpoint) {
+            if err.kind() == PermissionDenied {
+                // Linux always returns EPERM for non-root users.  We have to let the
+                // library go through the setuid-root "fusermount -u" to unmount.
+                fuse_unmount_pure(&self.mountpoint)
+            } else {
+                error!("Unmount failed: {}", err)
+            }
+        }
+    }
+}
+
+fn fuse_mount_pure(
+    mountpoint: &OsStr,
+    options: &[MountOption],
+) -> Result<(File, Option<UnixStream>), io::Error> {
     if options.contains(&MountOption::AutoUnmount) {
         // Auto unmount is only supported via fusermount
         return fuse_mount_fusermount(mountpoint, options);
     }
 
     let res = fuse_mount_sys(mountpoint, options)?;
-    if let Some(fd) = res {
-        Ok(fd)
+    if let Some(file) = res {
+        Ok((file, None))
     } else {
         // Retry
         fuse_mount_fusermount(mountpoint, options)
     }
 }
 
-#[cfg(not(feature = "libfuse"))]
-pub fn fuse_unmount_pure(mountpoint: &CStr, fd: c_int) {
-    if fd != -1 {
-        let mut poll_result = libc::pollfd {
-            fd,
-            events: 0,
-            revents: 0,
-        };
-
-        unsafe {
-            let result = libc::poll(&mut poll_result, 1, 0);
-            libc::close(fd);
-            // If the filesystem has already been unmounted, avoid unmounting it again
-            // Unmounting it a second time could cause a race with a newly mounted filesystem
-            // living at the same mountpoint
-            if result > 0 && (poll_result.revents & libc::POLLERR) != 0 {
-                return;
-            }
-        }
-    }
-
+fn fuse_unmount_pure(mountpoint: &CStr) {
     #[cfg(target_os = "linux")]
     unsafe {
         let result = libc::umount2(mountpoint.as_ptr(), libc::MNT_DETACH);
@@ -160,7 +124,6 @@ pub fn fuse_unmount_pure(mountpoint: &CStr, fd: c_int) {
     }
 }
 
-#[cfg(not(feature = "libfuse"))]
 fn detect_fusermount_bin() -> String {
     for name in [
         FUSERMOUNT3_BIN.to_string(),
@@ -178,8 +141,7 @@ fn detect_fusermount_bin() -> String {
     FUSERMOUNT3_BIN.to_string()
 }
 
-#[cfg(not(feature = "libfuse"))]
-fn receive_fusermount_message(socket_fd: c_int) -> Result<c_int, Error> {
+fn receive_fusermount_message(socket: &UnixStream) -> Result<File, Error> {
     let mut io_vec_buf = [0u8];
     let mut io_vec = libc::iovec {
         iov_base: (&mut io_vec_buf).as_mut_ptr() as *mut libc::c_void,
@@ -216,7 +178,7 @@ fn receive_fusermount_message(socket_fd: c_int) -> Result<c_int, Error> {
     let mut result;
     loop {
         unsafe {
-            result = libc::recvmsg(socket_fd, &mut message, 0);
+            result = libc::recvmsg(socket.as_raw_fd(), &mut message, 0);
         }
         if result != -1 {
             break;
@@ -246,17 +208,23 @@ fn receive_fusermount_message(socket_fd: c_int) -> Result<c_int, Error> {
         }
         let fd_data = libc::CMSG_DATA(control_msg);
 
-        Ok(*(fd_data as *const c_int))
+        let fd = *(fd_data as *const c_int);
+        if fd < 0 {
+            Err(ErrorKind::InvalidData.into())
+        } else {
+            Ok(File::from_raw_fd(fd))
+        }
     }
 }
 
-#[cfg(not(feature = "libfuse"))]
-fn fuse_mount_fusermount(mountpoint: &OsStr, options: &[MountOption]) -> Result<c_int, Error> {
+fn fuse_mount_fusermount(
+    mountpoint: &OsStr,
+    options: &[MountOption],
+) -> Result<(File, Option<UnixStream>), Error> {
     let (child_socket, receive_socket) = UnixStream::pair()?;
 
-    let comm_fd = child_socket.into_raw_fd();
     unsafe {
-        libc::fcntl(comm_fd, libc::F_SETFD, 0);
+        libc::fcntl(child_socket.as_raw_fd(), libc::F_SETFD, 0);
     }
 
     let mut builder = Command::new(detect_fusermount_bin());
@@ -269,20 +237,19 @@ fn fuse_mount_fusermount(mountpoint: &OsStr, options: &[MountOption]) -> Result<
     builder
         .arg("--")
         .arg(mountpoint)
-        .env(FUSERMOUNT_COMM_ENV, comm_fd.to_string());
+        .env(FUSERMOUNT_COMM_ENV, child_socket.as_raw_fd().to_string());
 
     let fusermount_child = builder.spawn()?;
 
-    let child_socket = unsafe { UnixStream::from_raw_fd(comm_fd) };
     drop(child_socket); // close socket in parent
 
-    let receive_fd = receive_socket.into_raw_fd();
-    let fd = receive_fusermount_message(receive_fd)?;
+    let file = receive_fusermount_message(&receive_socket)?;
+    let mut receive_socket = Some(receive_socket);
 
     if !options.contains(&MountOption::AutoUnmount) {
         // Only close the socket, if auto unmount is not set.
         // fusermount will keep running until the socket is closed, if auto unmount is set
-        drop(unsafe { UnixStream::from_raw_fd(receive_fd) });
+        drop(mem::take(&mut receive_socket));
         let output = fusermount_child.wait_with_output()?;
         debug!("fusermount: {}", String::from_utf8_lossy(&output.stdout));
         debug!("fusermount: {}", String::from_utf8_lossy(&output.stderr));
@@ -313,22 +280,15 @@ fn fuse_mount_fusermount(mountpoint: &OsStr, options: &[MountOption]) -> Result<
         }
     }
 
-    if fd < 0 {
-        return Err(Error::from(ErrorKind::InvalidData));
-    }
-
-    assert!(fd > 2);
-
     unsafe {
-        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
     }
 
-    Ok(fd)
+    Ok((file, receive_socket))
 }
 
 // If returned option is none. Then fusermount binary should be tried
-#[cfg(not(feature = "libfuse"))]
-fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<c_int>, Error> {
+fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<File>, Error> {
     let fuse_device_name = "/dev/fuse";
 
     let mountpoint_mode = File::open(mountpoint)?.metadata()?.permissions().mode();
@@ -336,12 +296,12 @@ fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<
     // Auto unmount requests must be sent to fusermount binary
     assert!(!options.contains(&MountOption::AutoUnmount));
 
-    let fd = match OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .write(true)
         .open(fuse_device_name)
     {
-        Ok(file) => file.into_raw_fd(),
+        Ok(file) => file,
         Err(error) => {
             if error.kind() == ErrorKind::NotFound {
                 error!("{} not found. Try 'modprobe fuse'", fuse_device_name);
@@ -349,11 +309,15 @@ fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<
             return Err(error);
         }
     };
-    assert!(fd > 2, "Conflict with stdin/stdout/stderr. fd={}", fd);
+    assert!(
+        file.as_raw_fd() > 2,
+        "Conflict with stdin/stdout/stderr. fd={}",
+        file.as_raw_fd()
+    );
 
     let mut mount_options = format!(
         "fd={},rootmode={:o},user_id={},group_id={}",
-        fd,
+        file.as_raw_fd(),
         mountpoint_mode,
         users::get_current_uid(),
         users::get_current_gid()
@@ -451,5 +415,76 @@ fn fuse_mount_sys(mountpoint: &OsStr, options: &[MountOption]) -> Result<Option<
         }
     }
 
-    Ok(Some(fd))
+    Ok(Some(file))
+}
+
+#[derive(PartialEq)]
+pub enum MountOptionGroup {
+    KernelOption,
+    KernelFlag,
+    Fusermount,
+}
+
+pub fn option_group(option: &MountOption) -> MountOptionGroup {
+    match option {
+        MountOption::FSName(_) => MountOptionGroup::Fusermount,
+        MountOption::Subtype(_) => MountOptionGroup::Fusermount,
+        MountOption::CUSTOM(_) => MountOptionGroup::KernelOption,
+        MountOption::AutoUnmount => MountOptionGroup::Fusermount,
+        MountOption::AllowOther => MountOptionGroup::KernelOption,
+        MountOption::Dev => MountOptionGroup::KernelFlag,
+        MountOption::NoDev => MountOptionGroup::KernelFlag,
+        MountOption::Suid => MountOptionGroup::KernelFlag,
+        MountOption::NoSuid => MountOptionGroup::KernelFlag,
+        MountOption::RO => MountOptionGroup::KernelFlag,
+        MountOption::RW => MountOptionGroup::KernelFlag,
+        MountOption::Exec => MountOptionGroup::KernelFlag,
+        MountOption::NoExec => MountOptionGroup::KernelFlag,
+        MountOption::Atime => MountOptionGroup::KernelFlag,
+        MountOption::NoAtime => MountOptionGroup::KernelFlag,
+        MountOption::DirSync => MountOptionGroup::KernelFlag,
+        MountOption::Sync => MountOptionGroup::KernelFlag,
+        MountOption::Async => MountOptionGroup::KernelFlag,
+        MountOption::AllowRoot => MountOptionGroup::KernelOption,
+        MountOption::DefaultPermissions => MountOptionGroup::KernelOption,
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn option_to_flag(option: &MountOption) -> libc::c_ulong {
+    match option {
+        MountOption::Dev => 0, // There is no option for dev. It's the absence of NoDev
+        MountOption::NoDev => libc::MS_NODEV,
+        MountOption::Suid => 0,
+        MountOption::NoSuid => libc::MS_NOSUID,
+        MountOption::RW => 0,
+        MountOption::RO => libc::MS_RDONLY,
+        MountOption::Exec => 0,
+        MountOption::NoExec => libc::MS_NOEXEC,
+        MountOption::Atime => 0,
+        MountOption::NoAtime => libc::MS_NOATIME,
+        MountOption::Async => 0,
+        MountOption::Sync => libc::MS_SYNCHRONOUS,
+        MountOption::DirSync => libc::MS_DIRSYNC,
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn option_to_flag(option: &MountOption) -> libc::c_int {
+    match option {
+        MountOption::Dev => 0, // There is no option for dev. It's the absence of NoDev
+        MountOption::NoDev => libc::MNT_NODEV,
+        MountOption::Suid => 0,
+        MountOption::NoSuid => libc::MNT_NOSUID,
+        MountOption::RW => 0,
+        MountOption::RO => libc::MNT_RDONLY,
+        MountOption::Exec => 0,
+        MountOption::NoExec => libc::MNT_NOEXEC,
+        MountOption::Atime => 0,
+        MountOption::NoAtime => libc::MNT_NOATIME,
+        MountOption::Async => 0,
+        MountOption::Sync => libc::MNT_SYNCHRONOUS,
+        _ => unreachable!(),
+    }
 }

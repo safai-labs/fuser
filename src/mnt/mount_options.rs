@@ -1,6 +1,6 @@
-use std::collections::HashSet;
 use std::io;
 use std::io::ErrorKind;
+use std::{collections::HashSet, ffi::OsStr};
 
 /// Mount options accepted by the FUSE filesystem type
 /// See 'man mount.fuse' for details
@@ -56,6 +56,33 @@ pub enum MountOption {
     to libfuse, and not part of the kernel ABI */
 }
 
+impl MountOption {
+    pub(crate) fn from_str(s: &str) -> MountOption {
+        match s {
+            "auto_unmount" => MountOption::AutoUnmount,
+            "allow_other" => MountOption::AllowOther,
+            "allow_root" => MountOption::AllowRoot,
+            "default_permissions" => MountOption::DefaultPermissions,
+            "dev" => MountOption::Dev,
+            "nodev" => MountOption::NoDev,
+            "suid" => MountOption::Suid,
+            "nosuid" => MountOption::NoSuid,
+            "ro" => MountOption::RO,
+            "rw" => MountOption::RW,
+            "exec" => MountOption::Exec,
+            "noexec" => MountOption::NoExec,
+            "atime" => MountOption::Atime,
+            "noatime" => MountOption::NoAtime,
+            "dirsync" => MountOption::DirSync,
+            "sync" => MountOption::Sync,
+            "async" => MountOption::Async,
+            x if x.starts_with("fsname=") => MountOption::FSName(x[7..].into()),
+            x if x.starts_with("subtype=") => MountOption::Subtype(x[8..].into()),
+            x => MountOption::CUSTOM(x.into()),
+        }
+    }
+}
+
 pub fn check_option_conflicts(options: &[MountOption]) -> Result<(), io::Error> {
     let mut options_set = HashSet::new();
     options_set.extend(options.iter().cloned());
@@ -96,40 +123,6 @@ fn conflicts_with(option: &MountOption) -> Vec<MountOption> {
     }
 }
 
-#[derive(PartialEq)]
-#[cfg(not(feature = "libfuse"))]
-pub enum MountOptionGroup {
-    KernelOption,
-    KernelFlag,
-    Fusermount,
-}
-
-#[cfg(not(feature = "libfuse"))]
-pub fn option_group(option: &MountOption) -> MountOptionGroup {
-    match option {
-        MountOption::FSName(_) => MountOptionGroup::Fusermount,
-        MountOption::Subtype(_) => MountOptionGroup::Fusermount,
-        MountOption::CUSTOM(_) => MountOptionGroup::KernelOption,
-        MountOption::AutoUnmount => MountOptionGroup::Fusermount,
-        MountOption::AllowOther => MountOptionGroup::KernelOption,
-        MountOption::Dev => MountOptionGroup::KernelFlag,
-        MountOption::NoDev => MountOptionGroup::KernelFlag,
-        MountOption::Suid => MountOptionGroup::KernelFlag,
-        MountOption::NoSuid => MountOptionGroup::KernelFlag,
-        MountOption::RO => MountOptionGroup::KernelFlag,
-        MountOption::RW => MountOptionGroup::KernelFlag,
-        MountOption::Exec => MountOptionGroup::KernelFlag,
-        MountOption::NoExec => MountOptionGroup::KernelFlag,
-        MountOption::Atime => MountOptionGroup::KernelFlag,
-        MountOption::NoAtime => MountOptionGroup::KernelFlag,
-        MountOption::DirSync => MountOptionGroup::KernelFlag,
-        MountOption::Sync => MountOptionGroup::KernelFlag,
-        MountOption::Async => MountOptionGroup::KernelFlag,
-        MountOption::AllowRoot => MountOptionGroup::KernelOption,
-        MountOption::DefaultPermissions => MountOptionGroup::KernelOption,
-    }
-}
-
 // Format option to be passed to libfuse or kernel
 pub fn option_to_string(option: &MountOption) -> String {
     match option {
@@ -156,53 +149,89 @@ pub fn option_to_string(option: &MountOption) -> String {
     }
 }
 
-#[cfg(all(not(feature = "libfuse"), target_os = "linux"))]
-pub fn option_to_flag(option: &MountOption) -> libc::c_ulong {
-    match option {
-        MountOption::Dev => 0, // There is no option for dev. It's the absence of NoDev
-        MountOption::NoDev => libc::MS_NODEV,
-        MountOption::Suid => 0,
-        MountOption::NoSuid => libc::MS_NOSUID,
-        MountOption::RW => 0,
-        MountOption::RO => libc::MS_RDONLY,
-        MountOption::Exec => 0,
-        MountOption::NoExec => libc::MS_NOEXEC,
-        MountOption::Atime => 0,
-        MountOption::NoAtime => libc::MS_NOATIME,
-        MountOption::Async => 0,
-        MountOption::Sync => libc::MS_SYNCHRONOUS,
-        MountOption::DirSync => libc::MS_DIRSYNC,
-        _ => unreachable!(),
+/// Parses mount command args.
+///
+/// Input: ["-o", "suid", "-o", "ro,nodev,noexec", "-osync"]
+/// Output Ok([Suid, RO, NoDev, NoExec, Sync])
+pub(crate) fn parse_options_from_args(args: &[&OsStr]) -> io::Result<Vec<MountOption>> {
+    let err = |x| io::Error::new(ErrorKind::InvalidInput, x);
+    let args: Option<Vec<_>> = args.iter().map(|x| x.to_str()).collect();
+    let args = args.ok_or_else(|| err("Error parsing args: Invalid UTF-8".to_owned()))?;
+    let mut it = args.iter();
+    let mut out = vec![];
+    loop {
+        let opt = match it.next() {
+            None => break,
+            Some(&"-o") => *it.next().ok_or(err(
+                "Error parsing args: Expected option, reached end of args".to_owned(),
+            ))?,
+            Some(x) if x.starts_with("-o") => &x[2..],
+            Some(x) => return Err(err(format!("Error parsing args: expected -o, got {}", x))),
+        };
+        for x in opt.split(",") {
+            out.push(MountOption::from_str(x))
+        }
     }
-}
-
-#[cfg(all(not(feature = "libfuse"), target_os = "macos"))]
-pub fn option_to_flag(option: &MountOption) -> libc::c_int {
-    match option {
-        MountOption::Dev => 0, // There is no option for dev. It's the absence of NoDev
-        MountOption::NoDev => libc::MNT_NODEV,
-        MountOption::Suid => 0,
-        MountOption::NoSuid => libc::MNT_NOSUID,
-        MountOption::RW => 0,
-        MountOption::RO => libc::MNT_RDONLY,
-        MountOption::Exec => 0,
-        MountOption::NoExec => libc::MNT_NOEXEC,
-        MountOption::Atime => 0,
-        MountOption::NoAtime => libc::MNT_NOATIME,
-        MountOption::Async => 0,
-        MountOption::Sync => libc::MNT_SYNCHRONOUS,
-        _ => unreachable!(),
-    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod test {
-    use crate::mount_options::check_option_conflicts;
-    use crate::MountOption;
+    use std::os::unix::prelude::OsStrExt;
+
+    use super::*;
 
     #[test]
     fn option_checking() {
         assert!(check_option_conflicts(&[MountOption::Suid, MountOption::NoSuid]).is_err());
         assert!(check_option_conflicts(&[MountOption::Suid, MountOption::NoExec]).is_ok());
+    }
+    #[test]
+    fn option_round_trip() {
+        use super::MountOption::*;
+        for x in [
+            FSName("Blah".to_owned()),
+            Subtype("Bloo".to_owned()),
+            CUSTOM("bongos".to_owned()),
+            AllowOther,
+            AllowRoot,
+            AutoUnmount,
+            DefaultPermissions,
+            Dev,
+            NoDev,
+            Suid,
+            NoSuid,
+            RO,
+            RW,
+            Exec,
+            NoExec,
+            Atime,
+            NoAtime,
+            DirSync,
+            Sync,
+            Async,
+        ]
+        .iter()
+        {
+            assert_eq!(*x, MountOption::from_str(option_to_string(x).as_ref()))
+        }
+    }
+
+    #[test]
+    fn test_parse_options() {
+        use super::MountOption::*;
+
+        assert_eq!(parse_options_from_args(&[]).unwrap(), &[]);
+
+        let o: Vec<_> = "-o suid -o ro,nodev,noexec -osync"
+            .split(" ")
+            .map(OsStr::new)
+            .collect();
+        let out = parse_options_from_args(o.as_ref()).unwrap();
+        assert_eq!(out, [Suid, RO, NoDev, NoExec, Sync]);
+
+        assert!(parse_options_from_args(&[OsStr::new("-o")]).is_err());
+        assert!(parse_options_from_args(&[OsStr::new("not o")]).is_err());
+        assert!(parse_options_from_args(&[OsStr::from_bytes(b"-o\xc3\x28")]).is_err());
     }
 }
