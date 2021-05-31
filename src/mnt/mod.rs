@@ -19,12 +19,6 @@ pub mod mount_options;
 use fuse2_sys::fuse_args;
 #[cfg(any(test, not(feature = "libfuse")))]
 use std::fs::File;
-<<<<<<< HEAD
-// use std::io;
-=======
-#[cfg(any(test, not(feature = "libfuse3")))]
-use std::io;
->>>>>>> 6ec7bcb... Fix a bunch of warnings
 
 #[cfg(any(feature = "libfuse", test))]
 use mount_options::MountOption;
@@ -62,7 +56,9 @@ use std::ffi::CStr;
 
 #[cfg(not(feature = "libfuse3"))]
 #[inline]
-fn libc_umount(mnt: &CStr) -> io::Result<()> {
+fn libc_umount(mnt: &CStr) -> std::io::Result<()> {
+    use std::io;
+
     #[cfg(any(
         target_os = "macos",
         target_os = "freebsd",
@@ -83,7 +79,7 @@ fn libc_umount(mnt: &CStr) -> io::Result<()> {
     )))]
     let r = unsafe { libc::umount(mnt.as_ptr()) };
     if r < 0 {
-        Err(io::Error::last_os_error())
+        Err(std::io::Error::last_os_error())
     } else {
         Ok(())
     }
@@ -107,8 +103,8 @@ fn is_mounted(fuse_device: &File) -> bool {
             0 => true,
             1 => (poll_result.revents & libc::POLLERR) != 0,
             -1 => {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 } else {
                     // This should never happen. The fd is guaranteed good as `File` owns it.
