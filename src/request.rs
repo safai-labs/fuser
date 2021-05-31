@@ -5,7 +5,7 @@
 //!
 //! TODO: This module is meant to go away soon in favor of `ll::Request`.
 
-use crate::ll::{fuse_abi as abi, Errno, Response};
+use crate::ll::{fuse_abi as abi, Errno, Response, INodeNo};
 use log::{debug, error, warn};
 use std::convert::TryFrom;
 #[cfg(feature = "abi-7-28")]
@@ -587,7 +587,7 @@ impl<'a> Request<'a> {
     /// Returns the nodeid of this request
     #[inline]
     #[allow(dead_code)]
-    pub fn nodeid(&self) -> u64 {
+    pub fn nodeid(&self) -> INodeNo {
         self.request.nodeid()
     }
 }

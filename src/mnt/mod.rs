@@ -20,7 +20,7 @@ use fuse2_sys::fuse_args;
 use mount_options::option_to_string;
 #[cfg(any(test, not(feature = "libfuse")))]
 use std::fs::File;
-use std::io;
+// use std::io;
 
 use mount_options::MountOption;
 

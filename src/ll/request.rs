@@ -1706,6 +1706,9 @@ mod op {
         pub fn mode(&self) -> i32 {
             self.arg.mode
         }
+
+        /// `reply` from FAllocate is empty
+        #[allow(dead_code)]
         pub fn reply(&self) -> Response {
             Response::new_empty()
         }
