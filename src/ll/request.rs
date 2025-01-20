@@ -282,7 +282,7 @@ mod op {
         path::Path,
         time::{Duration, SystemTime},
     };
-    use zerocopy::AsBytes;
+    use zerocopy::IntoBytes;
 
     /// Look up a directory entry by name and get its attributes.
     ///
@@ -427,6 +427,10 @@ mod op {
             #[cfg(target_os = "macos")]
             match self.arg.valid & FATTR_CRTIME {
                 0 => None,
+                // During certain operation, macOS use some helper that send request to the mountpoint with `crtime` set to 0xffffffff83da4f80.
+                // That value correspond to `-2_082_844_800u64` which is the difference between the date 1904-01-01 and 1970-01-01 because macOS epoch start at 1904 and not 1970.
+                // https://github.com/macfuse/macfuse/issues/1042
+                _ if self.arg.crtime == 0xffffffff83da4f80 => None,
                 _ => Some(
                     SystemTime::UNIX_EPOCH + Duration::new(self.arg.crtime, self.arg.crtimensec),
                 ),
@@ -874,6 +878,7 @@ mod op {
         GetSize(GetXAttrSize),
         /// User is requesting the data stored in the XAttr.  If the data will fit
         /// in this number of bytes it should be returned, otherwise return [Err(Errno::ERANGE)].
+        #[allow(dead_code)]
         Size(NonZeroU32),
     }
     impl<'a> GetXAttr<'a> {
@@ -1517,6 +1522,7 @@ mod op {
     }
 
     /// Copy the specified range from the source inode to the destination inode
+    #[cfg(feature = "abi-7-28")]
     #[derive(Debug, Clone, Copy)]
     pub struct CopyFileRangeFile {
         pub inode: INodeNo,
@@ -1885,6 +1891,7 @@ pub enum Operation<'a> {
     Forget(Forget<'a>),
     GetAttr(GetAttr<'a>),
     SetAttr(SetAttr<'a>),
+    #[allow(dead_code)]
     ReadLink(ReadLink<'a>),
     SymLink(SymLink<'a>),
     MkNod(MkNod<'a>),
@@ -1896,6 +1903,7 @@ pub enum Operation<'a> {
     Open(Open<'a>),
     Read(Read<'a>),
     Write(Write<'a>),
+    #[allow(dead_code)]
     StatFs(StatFs<'a>),
     Release(Release<'a>),
     FSync(FSync<'a>),
@@ -1922,6 +1930,7 @@ pub enum Operation<'a> {
     #[cfg(feature = "abi-7-11")]
     Poll(Poll<'a>),
     #[cfg(feature = "abi-7-15")]
+    #[allow(dead_code)]
     NotifyReply(NotifyReply<'a>),
     #[cfg(feature = "abi-7-16")]
     BatchForget(BatchForget<'a>),
@@ -1944,6 +1953,7 @@ pub enum Operation<'a> {
     Exchange(Exchange<'a>),
 
     #[cfg(feature = "abi-7-12")]
+    #[allow(dead_code)]
     CuseInit(CuseInit<'a>),
 }
 

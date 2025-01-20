@@ -19,6 +19,8 @@ use crate::reply::ReplyDirectoryPlus;
 use crate::reply::{Reply, ReplyDirectory, ReplySender};
 use crate::session::{Session, SessionACL};
 use crate::Filesystem;
+#[cfg(feature = "abi-7-11")]
+use crate::PollHandle;
 use crate::{ll, KernelConfig};
 
 /// Request data structure
@@ -522,11 +524,13 @@ impl<'a> Request<'a> {
             }
             #[cfg(feature = "abi-7-11")]
             ll::Operation::Poll(x) => {
+                let ph = PollHandle::new(se.ch.sender(), x.kernel_handle());
+
                 se.filesystem.poll(
                     self,
                     self.request.nodeid().into(),
                     x.file_handle().into(),
-                    x.kernel_handle(),
+                    ph,
                     x.events(),
                     x.flags(),
                     self.reply(),
@@ -611,9 +615,9 @@ impl<'a> Request<'a> {
                 se.filesystem.setvolname(self, x.name(), self.reply());
             }
             #[cfg(target_os = "macos")]
-            ll::Operation::GetXTimes(_) => {
+            ll::Operation::GetXTimes(x) => {
                 se.filesystem
-                    .getxtimes(self, self.request.nodeid().into(), self.reply());
+                    .getxtimes(self, x.nodeid().into(), self.reply());
             }
             #[cfg(target_os = "macos")]
             ll::Operation::Exchange(x) => {
